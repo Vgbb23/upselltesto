@@ -203,11 +203,114 @@ const hasCoreCustomerFields = (data: Partial<CheckoutData>) => {
   );
 };
 
+const normalizePhoneForApi = (phoneValue: string) => {
+  const digits = phoneValue.replace(/\D/g, '');
+  return digits.startsWith('55') ? digits : `55${digits}`;
+};
+
+const parsePixChargeResult = (payload: any): PixChargeResult | null => {
+  const pickString = (...values: unknown[]) => {
+    const firstValid = values.find((value) => typeof value === 'string' && (value as string).trim().length > 0);
+    return typeof firstValid === 'string' ? firstValid : '';
+  };
+
+  const data = payload?.data ?? payload;
+  const pixData = data?.pix ?? data ?? {};
+  const root = payload ?? {};
+
+  const pixCode = pickString(
+    pixData.copy_paste,
+    pixData.copyPaste,
+    pixData.emv,
+    pixData.payload,
+    pixData.code,
+    data.copy_paste,
+    data.copyPaste,
+    data.emv,
+    data.payload,
+    data.code,
+    root.copy_paste,
+    root.copyPaste,
+    root.emv,
+    root.payload,
+    root.code
+  );
+
+  let qrCodeUrl = pickString(
+    pixData.qr_code,
+    pixData.qrCode,
+    pixData.qrcode,
+    data.qr_code,
+    data.qrCode,
+    data.qrcode,
+    root.qr_code,
+    root.qrCode,
+    root.qrcode
+  );
+
+  if (qrCodeUrl && !qrCodeUrl.startsWith('http') && !qrCodeUrl.startsWith('data:image')) {
+    qrCodeUrl = `data:image/png;base64,${qrCodeUrl}`;
+  }
+
+  if (!qrCodeUrl && pixCode) {
+    qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(pixCode)}`;
+  }
+
+  if (!pixCode || !qrCodeUrl) return null;
+
+  const orderId = data?.order_id ?? data?.orderId ?? root?.order_id ?? root?.orderId ?? '';
+
+  return {
+    orderId,
+    pixCode,
+    qrCodeUrl,
+  };
+};
+
+/** Dados enviados pelo checkout principal via query `prefill` (base64url JSON { n, e, p, c }). */
+const decodeCustomerPrefillParam = (raw: string | null): Partial<CheckoutData> | null => {
+  if (!raw?.trim()) return null;
+  try {
+    let b64 = raw.trim().replace(/-/g, '+').replace(/_/g, '/');
+    const pad = b64.length % 4;
+    if (pad) b64 += '='.repeat(4 - pad);
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    const json = new TextDecoder().decode(bytes);
+    const o = JSON.parse(json) as Record<string, unknown>;
+    const name = typeof o.n === 'string' ? o.n : typeof o.name === 'string' ? o.name : '';
+    const email = typeof o.e === 'string' ? o.e : typeof o.email === 'string' ? o.email : '';
+    const pRaw = typeof o.p === 'string' ? o.p : typeof o.phone === 'string' ? o.phone : '';
+    const cRaw = typeof o.c === 'string' ? o.c : typeof o.cpf === 'string' ? o.cpf : '';
+    if (!name.trim() || !email.trim() || !pRaw || !cRaw) return null;
+    return {
+      name: name.trim(),
+      email: email.trim(),
+      phone: formatPhoneForForm(pRaw),
+      cpf: formatCpfForForm(cRaw),
+    };
+  } catch {
+    return null;
+  }
+};
+
 type PriorOrderPrefill = {
   status: 'loading' | 'ready' | 'error' | 'no_id';
   errorMessage?: string;
   partial: Partial<CheckoutData> | null;
   orderId: string | null;
+};
+
+const buildInitialPriorOrderPrefill = (): PriorOrderPrefill => {
+  const params = new URLSearchParams(window.location.search);
+  const orderId = params.get('orderId')?.trim() || params.get('order_id')?.trim() || null;
+  const fromCheckoutMain = decodeCustomerPrefillParam(params.get('prefill'));
+  if (fromCheckoutMain && hasCoreCustomerFields(fromCheckoutMain)) {
+    return {status: 'ready', partial: fromCheckoutMain, orderId, errorMessage: undefined};
+  }
+  if (orderId) return {status: 'loading', partial: null, orderId};
+  return {status: 'no_id', partial: null, orderId: null};
 };
 
 // --- Components ---
@@ -366,70 +469,6 @@ const Checkout = ({
     setFormData(prev => ({ ...prev, [name]: formattedValue }));
   };
 
-  const normalizePhone = (phoneValue: string) => {
-    const digits = phoneValue.replace(/\D/g, '');
-    return digits.startsWith('55') ? digits : `55${digits}`;
-  };
-
-  const getPixPayloadFromResponse = (payload: any): PixChargeResult | null => {
-    const pickString = (...values: unknown[]) => {
-      const firstValid = values.find((value) => typeof value === 'string' && (value as string).trim().length > 0);
-      return typeof firstValid === 'string' ? firstValid : '';
-    };
-
-    const data = payload?.data ?? payload;
-    const pixData = data?.pix ?? data ?? {};
-    const root = payload ?? {};
-
-    const pixCode = pickString(
-      pixData.copy_paste,
-      pixData.copyPaste,
-      pixData.emv,
-      pixData.payload,
-      pixData.code,
-      data.copy_paste,
-      data.copyPaste,
-      data.emv,
-      data.payload,
-      data.code,
-      root.copy_paste,
-      root.copyPaste,
-      root.emv,
-      root.payload,
-      root.code
-    );
-
-    let qrCodeUrl = pickString(
-      pixData.qr_code,
-      pixData.qrCode,
-      pixData.qrcode,
-      data.qr_code,
-      data.qrCode,
-      data.qrcode,
-      root.qr_code,
-      root.qrCode,
-      root.qrcode
-    );
-
-    if (qrCodeUrl && !qrCodeUrl.startsWith('http') && !qrCodeUrl.startsWith('data:image')) {
-      qrCodeUrl = `data:image/png;base64,${qrCodeUrl}`;
-    }
-
-    if (!qrCodeUrl && pixCode) {
-      qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(pixCode)}`;
-    }
-
-    if (!pixCode || !qrCodeUrl) return null;
-
-    const orderId = data?.order_id ?? data?.orderId ?? root?.order_id ?? root?.orderId ?? '';
-
-    return {
-      orderId,
-      pixCode,
-      qrCodeUrl,
-    };
-  };
-
   const createPixCharge = async () => {
     setIsCreatingPixCharge(true);
     setPaymentError('');
@@ -445,7 +484,7 @@ const Checkout = ({
         body: JSON.stringify({
           name: formData.name.trim(),
           email: formData.email.trim(),
-          phone: normalizePhone(formData.phone),
+          phone: normalizePhoneForApi(formData.phone),
           cpf: formData.cpf.replace(/\D/g, ''),
           lineItems: checkoutItems,
           totalValue: Math.round(subtotalValue * 100),
@@ -461,7 +500,7 @@ const Checkout = ({
         return false;
       }
 
-      const pixData = getPixPayloadFromResponse(result);
+      const pixData = parsePixChargeResult(result);
       if (!pixData) {
         const preview = JSON.stringify(result).slice(0, 300);
         throw new Error(
@@ -810,13 +849,13 @@ const HARD_BOOST_GEL_UPSELL: UpsellOffer = {
 };
 
 const UpsellPage = () => {
-  const [view, setView] = useState<'selection' | 'checkout'>('selection');
-  const [priorOrderPrefill, setPriorOrderPrefill] = useState<PriorOrderPrefill>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const oid = params.get('orderId')?.trim() || params.get('order_id')?.trim() || null;
-    if (!oid) return {status: 'no_id', partial: null, orderId: null};
-    return {status: 'loading', partial: null, orderId: oid};
-  });
+  const [view, setView] = useState<'selection' | 'checkout' | 'pix'>('selection');
+  const [priorOrderPrefill, setPriorOrderPrefill] = useState<PriorOrderPrefill>(buildInitialPriorOrderPrefill);
+  const [ctaPixCharge, setCtaPixCharge] = useState<PixChargeResult | null>(null);
+  const [ctaPixError, setCtaPixError] = useState('');
+  const [ctaPixLoading, setCtaPixLoading] = useState(false);
+  const [ctaPixCopied, setCtaPixCopied] = useState(false);
+  const [hadPrefillQuery] = useState(() => Boolean(new URLSearchParams(window.location.search).get('prefill')?.trim()));
 
   useEffect(() => {
     if (priorOrderPrefill.status !== 'loading' || !priorOrderPrefill.orderId) return undefined;
@@ -866,8 +905,85 @@ const UpsellPage = () => {
     };
   }, [priorOrderPrefill.status, priorOrderPrefill.orderId]);
 
-  const selectionCtaDisabled =
-    Boolean(priorOrderPrefill.orderId) && priorOrderPrefill.status === 'loading';
+  const selectionCtaDisabled = priorOrderPrefill.status === 'loading';
+
+  const customerForPix = priorOrderPrefill.partial;
+  const canGeneratePixFromPrior =
+    priorOrderPrefill.status === 'ready' && customerForPix && hasCoreCustomerFields(customerForPix);
+
+  const hardBoostUnit = parseFloat(HARD_BOOST_GEL_UPSELL.price.replace(',', '.'));
+  const hardBoostLineItems: CheckoutLineItem[] = [
+    {
+      id: HARD_BOOST_GEL_UPSELL.id,
+      name: HARD_BOOST_GEL_UPSELL.name,
+      value: Math.round(hardBoostUnit * 100),
+      quantity: 1,
+    },
+  ];
+
+  const handleMainCta = async () => {
+    if (!canGeneratePixFromPrior || !customerForPix) {
+      setView('checkout');
+      window.scrollTo(0, 0);
+      return;
+    }
+
+    setCtaPixLoading(true);
+    setCtaPixError('');
+    setCtaPixCharge(null);
+
+    try {
+      const response = await fetch('/api/pix/charge', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          name: (customerForPix.name ?? '').trim(),
+          email: (customerForPix.email ?? '').trim(),
+          phone: normalizePhoneForApi(customerForPix.phone ?? ''),
+          cpf: (customerForPix.cpf ?? '').replace(/\D/g, ''),
+          lineItems: hardBoostLineItems,
+          totalValue: Math.round(hardBoostUnit * 100),
+          utm: getUtmPayload(),
+        }),
+      });
+
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result?.success) {
+        const msg = result?.message ?? 'Não foi possível criar a cobrança PIX.';
+        const hint = result?.hint;
+        setCtaPixError(hint ? `${msg}\n\n${hint}` : msg);
+        return;
+      }
+
+      const pixData = parsePixChargeResult(result);
+      if (!pixData) {
+        setCtaPixError('Resposta da Fruitfy em formato inesperado. Tente o checkout manual abaixo.');
+        return;
+      }
+
+      setCtaPixCharge(pixData);
+      setView('pix');
+      window.scrollTo(0, 0);
+    } catch (e) {
+      setCtaPixError(e instanceof Error ? e.message : 'Erro ao gerar PIX.');
+    } finally {
+      setCtaPixLoading(false);
+    }
+  };
+
+  const copyCtaPixCode = async () => {
+    if (!ctaPixCharge?.pixCode) return;
+    try {
+      await navigator.clipboard.writeText(ctaPixCharge.pixCode);
+      setCtaPixCopied(true);
+      setTimeout(() => setCtaPixCopied(false), 2500);
+    } catch {
+      setCtaPixError('Não foi possível copiar o código PIX.');
+    }
+  };
 
   if (view === 'checkout') {
     return (
@@ -876,6 +992,73 @@ const UpsellPage = () => {
         onBack={() => setView('selection')}
         priorOrderPrefill={priorOrderPrefill}
       />
+    );
+  }
+
+  if (view === 'pix' && ctaPixCharge) {
+    const totalLabel = HARD_BOOST_GEL_UPSELL.price;
+    return (
+      <div className="min-h-screen bg-slate-50 pb-12">
+        <CheckoutHeader />
+        <div className="max-w-xl mx-auto px-5">
+          <button
+            type="button"
+            onClick={() => {
+              setView('selection');
+              setCtaPixCharge(null);
+              setCtaPixError('');
+            }}
+            className="flex items-center gap-2 text-slate-500 mb-8 hover:text-slate-800 transition-colors"
+          >
+            <ArrowLeft size={20} /> Voltar à oferta
+          </button>
+          <div className="bg-white rounded-3xl p-8 shadow-xl border border-slate-100 text-center">
+            <div className="inline-flex items-center justify-center w-16 h-16 bg-green-100 text-green-600 rounded-full mb-6">
+              <QrCode size={32} />
+            </div>
+            <h2 className="text-2xl font-black mb-2 uppercase italic">Pague com PIX</h2>
+            <p className="text-slate-500 text-sm mb-4">
+              Cobrança do <span className="font-bold text-slate-800">Hard Boost Gel</span> — finalize no app do banco.
+            </p>
+            <div className="mb-8">
+              <span className="text-slate-400 text-[10px] font-bold uppercase tracking-widest block mb-1">Valor</span>
+              <span className="text-3xl font-black text-rose-600 italic">R$ {totalLabel}</span>
+            </div>
+            <div className="bg-slate-50 p-6 rounded-2xl mb-8 flex flex-col items-center">
+              <img
+                src={ctaPixCharge.qrCodeUrl}
+                alt="QR Code PIX"
+                className="w-48 h-48 mb-4"
+                referrerPolicy="no-referrer"
+              />
+              <p className="text-[10px] text-slate-400 uppercase font-bold tracking-widest">Aguardando pagamento...</p>
+              {ctaPixCharge.orderId ? (
+                <p className="text-[10px] text-slate-400 mt-2">Pedido: {ctaPixCharge.orderId}</p>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              onClick={copyCtaPixCode}
+              className={`w-full py-4 rounded-xl font-bold flex items-center justify-center gap-2 mb-4 transition-colors ${
+                ctaPixCopied ? 'bg-emerald-600 text-white' : 'bg-slate-900 text-white hover:bg-slate-800'
+              }`}
+            >
+              <Copy size={18} /> {ctaPixCopied ? 'COPIADO' : 'COPIAR CÓDIGO PIX'}
+            </button>
+            {ctaPixError ? <p className="text-xs text-red-600 font-bold whitespace-pre-line">{ctaPixError}</p> : null}
+            <div className="text-left bg-blue-50 p-4 rounded-xl border border-blue-100">
+              <h4 className="text-blue-800 font-bold text-xs uppercase mb-2 flex items-center gap-2">
+                <Zap size={14} /> Como pagar?
+              </h4>
+              <ol className="text-[11px] text-blue-700 space-y-1 list-decimal ml-4">
+                <li>Abra o app do seu banco</li>
+                <li>Escolha PIX &gt; Copia e Cola ou QR Code</li>
+                <li>Finalize o pagamento</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </div>
     );
   }
 
@@ -932,7 +1115,15 @@ const UpsellPage = () => {
               Carregando seus dados do pedido anterior…
             </p>
           )}
-          {priorOrderPrefill.orderId && priorOrderPrefill.status === 'error' && priorOrderPrefill.errorMessage && (
+          {hadPrefillQuery && canGeneratePixFromPrior && (
+            <p className="text-sm text-emerald-800 font-semibold max-w-lg mx-auto bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3">
+              Dados do checkout Testo Hard recebidos. Ao clicar no botão abaixo, o PIX do gel é gerado na hora — sem digitar de novo.
+            </p>
+          )}
+          {priorOrderPrefill.orderId &&
+            priorOrderPrefill.status === 'error' &&
+            priorOrderPrefill.errorMessage &&
+            !canGeneratePixFromPrior && (
             <p className="text-sm text-amber-800 font-semibold max-w-lg mx-auto bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
               {priorOrderPrefill.errorMessage} Você poderá preencher manualmente no checkout.
             </p>
@@ -940,7 +1131,8 @@ const UpsellPage = () => {
           {priorOrderPrefill.orderId &&
             priorOrderPrefill.status === 'ready' &&
             priorOrderPrefill.partial &&
-            hasCoreCustomerFields(priorOrderPrefill.partial) && (
+            hasCoreCustomerFields(priorOrderPrefill.partial) &&
+            !hadPrefillQuery && (
               <p className="text-sm text-emerald-800 font-semibold max-w-lg mx-auto bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3">
                 Dados do seu último pedido carregados — no checkout o PIX será gerado sem você digitar tudo de novo.
               </p>
@@ -1057,19 +1249,23 @@ const UpsellPage = () => {
           </div>
           <button
             type="button"
-            disabled={selectionCtaDisabled}
-            onClick={() => {
-              setView('checkout');
-              window.scrollTo(0, 0);
-            }}
+            disabled={selectionCtaDisabled || ctaPixLoading}
+            onClick={() => void handleMainCta()}
             className="w-full bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white py-5 rounded-2xl font-black text-sm md:text-base flex items-center justify-center gap-2 shadow-xl transition-all disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:from-emerald-500 disabled:hover:to-emerald-600"
           >
             {selectionCtaDisabled ? (
               <>CARREGANDO SEUS DADOS…</>
+            ) : ctaPixLoading ? (
+              <>GERANDO PIX…</>
+            ) : canGeneratePixFromPrior ? (
+              <>🟢 SIM! GERAR MEU PIX AGORA <ArrowRight size={22} className="shrink-0" /></>
             ) : (
               <>🟢 SIM! QUERO POTENCIALIZAR MINHA PERFORMANCE AGORA <ArrowRight size={22} className="shrink-0" /></>
             )}
           </button>
+          {ctaPixError ? (
+            <p className="text-xs text-amber-200 font-bold text-center mt-3 whitespace-pre-line px-2">{ctaPixError}</p>
+          ) : null}
           <p className="text-[9px] text-white/50 text-center mt-4 font-bold uppercase tracking-wider">
             Um dos complementos mais escolhidos com Testo Hard • checkout seguro
           </p>
