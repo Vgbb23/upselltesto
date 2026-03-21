@@ -54,6 +54,162 @@ interface CheckoutLineItem {
   quantity: number;
 }
 
+const UTM_KEYS = [
+  'utm_source',
+  'utm_medium',
+  'utm_campaign',
+  'utm_content',
+  'utm_term',
+] as const;
+
+type UtmKey = (typeof UTM_KEYS)[number];
+type UtmPayload = Record<UtmKey, string>;
+
+const getUtmPayload = (): UtmPayload => {
+  const searchParams = new URLSearchParams(window.location.search);
+  const utm: Partial<UtmPayload> = {};
+
+  UTM_KEYS.forEach((key) => {
+    const valueFromUrl = searchParams.get(key)?.trim() ?? '';
+    const storageKey = `utmify:${key}`;
+    const valueFromStorage = sessionStorage.getItem(storageKey)?.trim() ?? '';
+    const finalValue = valueFromUrl || valueFromStorage || '';
+
+    if (valueFromUrl) {
+      sessionStorage.setItem(storageKey, valueFromUrl);
+    }
+
+    utm[key] = finalValue;
+  });
+
+  return utm as UtmPayload;
+};
+
+const deepPick = (root: unknown, paths: string[]): string => {
+  for (const path of paths) {
+    const parts = path.split('.').filter(Boolean);
+    let cur: any = root;
+    for (const p of parts) {
+      cur = cur?.[p];
+      if (cur === undefined || cur === null) break;
+    }
+    if (typeof cur === 'string' && cur.trim()) return cur.trim();
+    if (typeof cur === 'number' && Number.isFinite(cur)) return String(cur);
+  }
+  return '';
+};
+
+const formatCpfForForm = (raw: string) => {
+  const d = raw.replace(/\D/g, '').slice(0, 11);
+  if (d.length <= 3) return d;
+  if (d.length <= 6) return `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6)}`;
+  if (d.length <= 9) return `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9)}`;
+  return `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9)}`;
+};
+
+const formatPhoneForForm = (raw: string) => {
+  let d = raw.replace(/\D/g, '');
+  if (d.startsWith('55') && d.length > 11) d = d.slice(2);
+  d = d.slice(0, 11);
+  if (d.length <= 2) return d.length ? `(${d}` : '';
+  if (d.length <= 6) return `(${d.slice(0, 2)}) ${d.slice(2)}`;
+  if (d.length <= 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
+  return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
+};
+
+/** Tenta montar CheckoutData a partir do JSON retornado por GET /api/order/:id (formato Fruitfy pode variar). */
+const extractCustomerFromOrderJson = (payload: unknown): Partial<CheckoutData> => {
+  if (!payload || typeof payload !== 'object') return {};
+  const p = payload as Record<string, any>;
+  const data = p.data ?? p;
+
+  const name =
+    deepPick(data, [
+      'customer.name',
+      'buyer.name',
+      'client.name',
+      'cliente.nome',
+      'shipping_address.name',
+      'nome',
+      'name',
+      'full_name',
+      'fullName',
+    ]) || deepPick(p, ['customer.name', 'name']);
+
+  const email =
+    deepPick(data, ['customer.email', 'buyer.email', 'email', 'mail']) || deepPick(p, ['customer.email', 'email']);
+
+  const phoneRaw =
+    deepPick(data, [
+      'customer.phone',
+      'customer.mobile',
+      'buyer.phone',
+      'phone',
+      'mobile',
+      'telephone',
+      'celular',
+      'whatsapp',
+    ]) || deepPick(p, ['customer.phone', 'phone']);
+
+  const cpfRaw =
+    deepPick(data, [
+      'customer.cpf',
+      'customer.document',
+      'cpf',
+      'document',
+      'tax_id',
+      'taxId',
+    ]) || deepPick(p, ['customer.cpf', 'cpf']);
+
+  const ship = data.shipping_address ?? data.delivery_address ?? data.shipping ?? data.endereco;
+  const cepRaw = ship
+    ? deepPick(ship, ['cep', 'postal_code', 'postalCode', 'zip', 'zipcode'])
+    : deepPick(data, ['cep', 'postal_code', 'zip']);
+  const address = ship
+    ? deepPick(ship, ['street', 'address', 'logradouro', 'line1', 'address_line_1', 'rua'])
+    : '';
+  const number = ship ? deepPick(ship, ['number', 'numero', 'street_number']) : '';
+  const complement = ship ? deepPick(ship, ['complement', 'complemento', 'line2']) : '';
+  const neighborhood = ship ? deepPick(ship, ['neighborhood', 'bairro', 'district']) : '';
+  const city = ship ? deepPick(ship, ['city', 'cidade', 'localidade']) : deepPick(data, ['city', 'cidade']);
+  const state = ship ? deepPick(ship, ['state', 'estado', 'uf', 'region']) : deepPick(data, ['state', 'uf']);
+
+  const out: Partial<CheckoutData> = {};
+  if (name) out.name = name;
+  if (email) out.email = email;
+  if (phoneRaw) out.phone = formatPhoneForForm(phoneRaw);
+  if (cpfRaw) out.cpf = formatCpfForForm(cpfRaw);
+  if (cepRaw) {
+    const c = cepRaw.replace(/\D/g, '').slice(0, 8);
+    out.cep = c.length === 8 ? `${c.slice(0, 5)}-${c.slice(5)}` : cepRaw;
+  }
+  if (address) out.address = address;
+  if (number) out.number = number;
+  if (complement) out.complement = complement;
+  if (neighborhood) out.neighborhood = neighborhood;
+  if (city) out.city = city;
+  if (state) out.state = state.length === 2 ? state.toUpperCase() : state;
+  return out;
+};
+
+const hasCoreCustomerFields = (data: Partial<CheckoutData>) => {
+  const phoneDigits = (data.phone ?? '').replace(/\D/g, '');
+  const cpfDigits = (data.cpf ?? '').replace(/\D/g, '');
+  return (
+    (data.name ?? '').trim().length > 1 &&
+    (data.email ?? '').includes('@') &&
+    phoneDigits.length >= 10 &&
+    cpfDigits.length === 11
+  );
+};
+
+type PriorOrderPrefill = {
+  status: 'loading' | 'ready' | 'error' | 'no_id';
+  errorMessage?: string;
+  partial: Partial<CheckoutData> | null;
+  orderId: string | null;
+};
+
 // --- Components ---
 
 const CheckoutHeader = () => (
@@ -77,7 +233,15 @@ const PixIcon = ({ className = '' }: { className?: string }) => (
   </svg>
 );
 
-const Checkout = ({ items, onBack }: { items: UpsellOffer[]; onBack: () => void }) => {
+const Checkout = ({
+  items,
+  onBack,
+  priorOrderPrefill,
+}: {
+  items: UpsellOffer[];
+  onBack: () => void;
+  priorOrderPrefill: PriorOrderPrefill;
+}) => {
   const [step, setStep] = useState<'form' | 'payment'>('form');
   const [itemQuantities, setItemQuantities] = useState<Record<number, number>>(
     () => Object.fromEntries(items.map((item) => [item.id, 1]))
@@ -120,6 +284,37 @@ const Checkout = ({ items, onBack }: { items: UpsellOffer[]; onBack: () => void 
     value: Math.round(parseFloat(item.price.replace(',', '.')) * 100),
     quantity: getItemQuantity(item.id),
   }));
+
+  useEffect(() => {
+    if (priorOrderPrefill.status !== 'ready' || !priorOrderPrefill.partial) return;
+    const p = priorOrderPrefill.partial;
+    setFormData((prev) => ({
+      ...prev,
+      name: p.name ?? prev.name,
+      email: p.email ?? prev.email,
+      phone: p.phone ?? prev.phone,
+      cpf: p.cpf ?? prev.cpf,
+      cep: p.cep ?? prev.cep,
+      address: p.address ?? prev.address,
+      number: p.number ?? prev.number,
+      complement: p.complement ?? prev.complement,
+      neighborhood: p.neighborhood ?? prev.neighborhood,
+      city: p.city ?? prev.city,
+      state: p.state ?? prev.state,
+    }));
+  }, [priorOrderPrefill.status, priorOrderPrefill.partial]);
+
+  const priorOrderBlocking =
+    Boolean(priorOrderPrefill.orderId) && priorOrderPrefill.status === 'loading';
+
+  const usePriorCustomerOnly =
+    priorOrderPrefill.status === 'ready' &&
+    hasCoreCustomerFields({
+      name: formData.name,
+      email: formData.email,
+      phone: formData.phone,
+      cpf: formData.cpf,
+    });
 
   useEffect(() => {
     const cep = formData.cep.replace(/\D/g, '');
@@ -254,6 +449,7 @@ const Checkout = ({ items, onBack }: { items: UpsellOffer[]; onBack: () => void 
           cpf: formData.cpf.replace(/\D/g, ''),
           lineItems: checkoutItems,
           totalValue: Math.round(subtotalValue * 100),
+          utm: getUtmPayload(),
         }),
       });
 
@@ -285,6 +481,7 @@ const Checkout = ({ items, onBack }: { items: UpsellOffer[]; onBack: () => void 
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (priorOrderBlocking) return;
     const isPixReady = await createPixCharge();
     if (!isPixReady) return;
     setStep('payment');
@@ -410,40 +607,92 @@ const Checkout = ({ items, onBack }: { items: UpsellOffer[]; onBack: () => void 
           </div>
           <div className="md:col-span-2 space-y-6">
             <form onSubmit={handleSubmit} className="space-y-6">
-              <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
-                <h3 className="text-lg font-black mb-6 flex items-center gap-2 uppercase italic"><User size={20} className="text-rose-600" /> Dados Pessoais</h3>
-                <div className="grid gap-4">
-                  <input required name="name" placeholder="Nome Completo" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.name} onChange={handleInputChange} />
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <input required type="email" name="email" placeholder="E-mail" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.email} onChange={handleInputChange} />
-                    <input required name="phone" placeholder="WhatsApp" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.phone} onChange={handleInputChange} />
-                  </div>
-                  <input required name="cpf" placeholder="CPF" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.cpf} onChange={handleInputChange} />
+              {priorOrderPrefill.orderId && priorOrderPrefill.status === 'loading' && (
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
+                  Carregando dados do seu pedido anterior…
                 </div>
-              </div>
-              <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
-                <h3 className="text-lg font-black mb-6 flex items-center gap-2 uppercase italic"><MapPin size={20} className="text-rose-600" /> Endereço</h3>
-                <div className="grid gap-4">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="relative">
-                      <input required name="cep" placeholder="CEP" className={`w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors ${isFetchingCep ? 'opacity-50' : ''}`} value={formData.cep} onChange={handleInputChange} />
-                      {isFetchingCep && <div className="absolute right-4 top-1/2 -translate-y-1/2"><div className="w-4 h-4 border-2 border-rose-600 border-t-transparent rounded-full animate-spin"></div></div>}
+              )}
+              {priorOrderPrefill.orderId && priorOrderPrefill.status === 'error' && priorOrderPrefill.errorMessage && (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                  {priorOrderPrefill.errorMessage} Preencha os dados manualmente abaixo.
+                </div>
+              )}
+              {usePriorCustomerOnly && (
+                <div className="bg-white rounded-3xl p-8 shadow-sm border border-emerald-100">
+                  <h3 className="text-lg font-black mb-4 flex items-center gap-2 uppercase italic text-emerald-800">
+                    <User size={20} className="text-emerald-600" /> Seus dados (pedido anterior)
+                  </h3>
+                  <p className="text-xs text-slate-500 mb-4">
+                    Usaremos estes dados para gerar o PIX do upsell — você não precisa digitar de novo.
+                  </p>
+                  <dl className="space-y-2 text-sm text-slate-800">
+                    <div><span className="font-bold text-slate-500">Nome:</span> {formData.name}</div>
+                    <div><span className="font-bold text-slate-500">E-mail:</span> {formData.email}</div>
+                    <div><span className="font-bold text-slate-500">WhatsApp:</span> {formData.phone}</div>
+                    <div><span className="font-bold text-slate-500">CPF:</span> {formData.cpf}</div>
+                    {priorOrderPrefill.orderId && (
+                      <div className="text-[11px] text-slate-400 pt-2">Referência: pedido {priorOrderPrefill.orderId}</div>
+                    )}
+                  </dl>
+                </div>
+              )}
+              {!usePriorCustomerOnly && (
+                <>
+                  <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
+                    <h3 className="text-lg font-black mb-6 flex items-center gap-2 uppercase italic"><User size={20} className="text-rose-600" /> Dados Pessoais</h3>
+                    <div className="grid gap-4">
+                      <input required name="name" placeholder="Nome Completo" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.name} onChange={handleInputChange} />
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <input required type="email" name="email" placeholder="E-mail" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.email} onChange={handleInputChange} />
+                        <input required name="phone" placeholder="WhatsApp" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.phone} onChange={handleInputChange} />
+                      </div>
+                      <input required name="cpf" placeholder="CPF" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.cpf} onChange={handleInputChange} />
                     </div>
-                    <input required name="city" placeholder="Cidade" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.city} onChange={handleInputChange} />
                   </div>
-                  <input required name="address" placeholder="Endereço" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.address} onChange={handleInputChange} />
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <input required name="number" placeholder="Número" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.number} onChange={handleInputChange} />
-                    <input name="complement" placeholder="Complemento" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.complement} onChange={handleInputChange} />
+                  <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
+                    <h3 className="text-lg font-black mb-6 flex items-center gap-2 uppercase italic"><MapPin size={20} className="text-rose-600" /> Endereço</h3>
+                    <div className="grid gap-4">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="relative">
+                          <input required name="cep" placeholder="CEP" className={`w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors ${isFetchingCep ? 'opacity-50' : ''}`} value={formData.cep} onChange={handleInputChange} />
+                          {isFetchingCep && <div className="absolute right-4 top-1/2 -translate-y-1/2"><div className="w-4 h-4 border-2 border-rose-600 border-t-transparent rounded-full animate-spin"></div></div>}
+                        </div>
+                        <input required name="city" placeholder="Cidade" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.city} onChange={handleInputChange} />
+                      </div>
+                      <input required name="address" placeholder="Endereço" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.address} onChange={handleInputChange} />
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <input required name="number" placeholder="Número" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.number} onChange={handleInputChange} />
+                        <input name="complement" placeholder="Complemento" className="w-full p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:border-rose-600 transition-colors" value={formData.complement} onChange={handleInputChange} />
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
 
-              {/* Opções de Frete - Aparece somente após preencher o CEP */}
-              {formData.cep.replace(/\D/g, '').length >= 8 && (
-                <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-100 animate-in fade-in slide-in-from-top-4 duration-500">
+                  {formData.cep.replace(/\D/g, '').length >= 8 && (
+                    <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-100 animate-in fade-in slide-in-from-top-4 duration-500">
+                      <h3 className="text-lg font-black mb-6 flex items-center gap-2 uppercase italic">
+                        <Truck size={20} className="text-rose-600" /> Opção de Entrega
+                      </h3>
+                      <div className="p-4 rounded-2xl border-2 border-rose-600 bg-rose-50 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-5 h-5 rounded-full border-2 border-rose-600 flex items-center justify-center">
+                            <div className="w-2.5 h-2.5 rounded-full bg-rose-600" />
+                          </div>
+                          <div className="text-left">
+                            <span className="block font-bold text-slate-800 text-sm">Frete Grátis</span>
+                            <span className="block text-[10px] text-slate-500 uppercase font-bold">Será enviado junto com o pedido anterior</span>
+                          </div>
+                        </div>
+                        <span className="text-green-600 font-black text-sm uppercase italic">Grátis</span>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {usePriorCustomerOnly && (
+                <div className="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
                   <h3 className="text-lg font-black mb-6 flex items-center gap-2 uppercase italic">
-                    <Truck size={20} className="text-rose-600" /> Opção de Entrega
+                    <Truck size={20} className="text-rose-600" /> Entrega
                   </h3>
                   <div className="p-4 rounded-2xl border-2 border-rose-600 bg-rose-50 flex items-center justify-between">
                     <div className="flex items-center gap-3">
@@ -452,7 +701,7 @@ const Checkout = ({ items, onBack }: { items: UpsellOffer[]; onBack: () => void 
                       </div>
                       <div className="text-left">
                         <span className="block font-bold text-slate-800 text-sm">Frete Grátis</span>
-                        <span className="block text-[10px] text-slate-500 uppercase font-bold">Será enviado junto com o pedido anterior</span>
+                        <span className="block text-[10px] text-slate-500 uppercase font-bold">Envio junto com seu pedido anterior</span>
                       </div>
                     </div>
                     <span className="text-green-600 font-black text-sm uppercase italic">Grátis</span>
@@ -482,8 +731,17 @@ const Checkout = ({ items, onBack }: { items: UpsellOffer[]; onBack: () => void 
                 </div>
               </div>
 
-              <button type="submit" disabled={isCreatingPixCharge} className="w-full bg-rose-600 text-white py-5 rounded-2xl font-black text-lg flex items-center justify-center gap-3 shadow-xl shadow-rose-200 hover:bg-rose-700 transition-all disabled:opacity-60 disabled:cursor-not-allowed">
-                {isCreatingPixCharge ? 'GERANDO PIX...' : 'FINALIZAR PEDIDO'} <ArrowRight size={24} />
+              <button
+                type="submit"
+                disabled={isCreatingPixCharge || priorOrderBlocking}
+                className="w-full bg-rose-600 text-white py-5 rounded-2xl font-black text-lg flex items-center justify-center gap-3 shadow-xl shadow-rose-200 hover:bg-rose-700 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {priorOrderBlocking
+                  ? 'CARREGANDO DADOS...'
+                  : isCreatingPixCharge
+                    ? 'GERANDO PIX...'
+                    : 'FINALIZAR PEDIDO'}{' '}
+                <ArrowRight size={24} />
               </button>
               {paymentError && <p className="text-xs text-red-600 font-bold -mt-2 whitespace-pre-line">{paymentError}</p>}
 
@@ -553,12 +811,70 @@ const HARD_BOOST_GEL_UPSELL: UpsellOffer = {
 
 const UpsellPage = () => {
   const [view, setView] = useState<'selection' | 'checkout'>('selection');
+  const [priorOrderPrefill, setPriorOrderPrefill] = useState<PriorOrderPrefill>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const oid = params.get('orderId')?.trim() || params.get('order_id')?.trim() || null;
+    if (!oid) return {status: 'no_id', partial: null, orderId: null};
+    return {status: 'loading', partial: null, orderId: oid};
+  });
+
+  useEffect(() => {
+    if (priorOrderPrefill.status !== 'loading' || !priorOrderPrefill.orderId) return undefined;
+    const oid = priorOrderPrefill.orderId;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await fetch(`/api/order/${encodeURIComponent(oid)}`, {
+          headers: {Accept: 'application/json'},
+        });
+        const json = await res.json().catch(() => null);
+        if (cancelled) return;
+        if (!res.ok) {
+          const msg =
+            (json && typeof json === 'object' && 'message' in json && typeof (json as {message?: string}).message === 'string'
+              ? (json as {message: string}).message
+              : null) ?? 'Não foi possível carregar o pedido anterior.';
+          setPriorOrderPrefill({
+            status: 'error',
+            partial: null,
+            orderId: oid,
+            errorMessage: msg,
+          });
+          return;
+        }
+        const partial = extractCustomerFromOrderJson(json);
+        setPriorOrderPrefill({
+          status: 'ready',
+          partial: Object.keys(partial).length ? partial : null,
+          orderId: oid,
+        });
+      } catch {
+        if (!cancelled) {
+          setPriorOrderPrefill({
+            status: 'error',
+            partial: null,
+            orderId: oid,
+            errorMessage: 'Falha de rede ao consultar o pedido.',
+          });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [priorOrderPrefill.status, priorOrderPrefill.orderId]);
+
+  const selectionCtaDisabled =
+    Boolean(priorOrderPrefill.orderId) && priorOrderPrefill.status === 'loading';
 
   if (view === 'checkout') {
     return (
       <Checkout
         items={[HARD_BOOST_GEL_UPSELL]}
         onBack={() => setView('selection')}
+        priorOrderPrefill={priorOrderPrefill}
       />
     );
   }
@@ -611,6 +927,24 @@ const UpsellPage = () => {
           <p className="inline-block bg-slate-900 text-white text-[10px] font-black uppercase tracking-widest px-3 py-1.5 rounded-full">
             Testo Hard: pedido aprovado ✓
           </p>
+          {priorOrderPrefill.orderId && priorOrderPrefill.status === 'loading' && (
+            <p className="text-sm text-slate-600 font-semibold max-w-lg mx-auto">
+              Carregando seus dados do pedido anterior…
+            </p>
+          )}
+          {priorOrderPrefill.orderId && priorOrderPrefill.status === 'error' && priorOrderPrefill.errorMessage && (
+            <p className="text-sm text-amber-800 font-semibold max-w-lg mx-auto bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+              {priorOrderPrefill.errorMessage} Você poderá preencher manualmente no checkout.
+            </p>
+          )}
+          {priorOrderPrefill.orderId &&
+            priorOrderPrefill.status === 'ready' &&
+            priorOrderPrefill.partial &&
+            hasCoreCustomerFields(priorOrderPrefill.partial) && (
+              <p className="text-sm text-emerald-800 font-semibold max-w-lg mx-auto bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3">
+                Dados do seu último pedido carregados — no checkout o PIX será gerado sem você digitar tudo de novo.
+              </p>
+            )}
           <h1 className="text-2xl md:text-3xl font-black text-slate-900 leading-tight">
             Falta o <span className="text-rose-600 italic">ataque final</span>: resposta na hora H, não “só um dia bom”.
           </h1>
@@ -723,13 +1057,18 @@ const UpsellPage = () => {
           </div>
           <button
             type="button"
+            disabled={selectionCtaDisabled}
             onClick={() => {
               setView('checkout');
               window.scrollTo(0, 0);
             }}
-            className="w-full bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white py-5 rounded-2xl font-black text-sm md:text-base flex items-center justify-center gap-2 shadow-xl transition-all"
+            className="w-full bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white py-5 rounded-2xl font-black text-sm md:text-base flex items-center justify-center gap-2 shadow-xl transition-all disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:from-emerald-500 disabled:hover:to-emerald-600"
           >
-            🟢 SIM! QUERO POTENCIALIZAR MINHA PERFORMANCE AGORA <ArrowRight size={22} className="shrink-0" />
+            {selectionCtaDisabled ? (
+              <>CARREGANDO SEUS DADOS…</>
+            ) : (
+              <>🟢 SIM! QUERO POTENCIALIZAR MINHA PERFORMANCE AGORA <ArrowRight size={22} className="shrink-0" /></>
+            )}
           </button>
           <p className="text-[9px] text-white/50 text-center mt-4 font-bold uppercase tracking-wider">
             Um dos complementos mais escolhidos com Testo Hard • checkout seguro

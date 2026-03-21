@@ -6,6 +6,7 @@ import 'dotenv/config';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import chargeHandler from './api/pix/charge.ts';
+import orderHandler from './api/order/getOrder.ts';
 
 async function main() {
   const app = express();
@@ -28,6 +29,16 @@ async function main() {
     await chargeHandler(req, res);
   });
 
+  app.options('/api/order/:orderId', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+    res.status(204).end();
+  });
+  app.get('/api/order/:orderId', async (req, res) => {
+    await orderHandler(req, res);
+  });
+
   // 3) Vite (HTML, React, assets) — só recebe o que não bateu nas rotas acima
   const vite = await createViteServer({
     server: { middlewareMode: true },
@@ -40,7 +51,8 @@ async function main() {
   app.listen(port, host, () => {
     console.log('');
     console.log('  Servidor: http://localhost:' + port);
-    console.log('  API PIX:  http://localhost:' + port + '/api/pix/charge');
+    console.log('  API PIX:   http://localhost:' + port + '/api/pix/charge');
+    console.log('  API Order: http://localhost:' + port + '/api/order/<orderId>');
     console.log('');
   });
 }

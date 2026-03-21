@@ -5,6 +5,7 @@
 import 'dotenv/config';
 import express from 'express';
 import chargeHandler from './api/pix/charge.ts';
+import orderHandler from './api/order/getOrder.ts';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -23,6 +24,16 @@ app.options('/api/pix/charge', (req, res) => {
 
 app.post('/api/pix/charge', async (req, res) => {
   await chargeHandler(req, res);
+});
+
+app.options('/api/order/:orderId', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  res.status(204).end();
+});
+app.get('/api/order/:orderId', async (req, res) => {
+  await orderHandler(req, res);
 });
 
 const port = Number(process.env.API_PORT) || 3001;
